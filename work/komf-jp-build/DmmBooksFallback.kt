@@ -20,7 +20,7 @@ import java.net.URI
 import java.text.Normalizer
 import java.util.Locale
 
-/** Public DMM Books pages, used only after BookWalker Japan has no match. */
+/** Public DMM Books pages used as the primary source for manga. */
 internal class DmmBooksFallback(private val http: HttpClient, private val config: ProviderConfig) {
     private val host = "book.dmm.com"
     private val base = "https://$host"

@@ -3,6 +3,9 @@ package snd.komf.providers.bookwalker
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import kotlinx.coroutines.runBlocking
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import snd.komf.model.MatchQuery
 import snd.komf.model.ProviderSeriesId
 import snd.komf.providers.ProviderConfig
@@ -31,18 +34,44 @@ fun main() = runBlocking {
 
         val provider = BookWalkerMetadataProvider(ProviderConfig(enabled = true), http)
         val automatic = checkNotNull(provider.matchSeriesMetadata(MatchQuery(query, null, null, null)))
-        check(automatic.id.value.substringBefore('@') == own.id)
+        check(automatic.metadata.links.single().url.startsWith("https://book.dmm.com/"))
         val manual = provider.searchSeries(query, 10)
-        check(manual.any { it.resultId == automatic.id.value })
-        val volume = automatic.books.single { it.number?.start == 1.0 }
-        val metadata = provider.getBookMetadata(automatic.id, volume.id).metadata
+        check(manual.first().resultId == automatic.id.value)
+
+        val direct = provider.searchSeries(work.books.first().url, 10).single()
+        check(direct.url == work.books.first().url)
+        val bookWalker = provider.getSeriesMetadata(ProviderSeriesId(direct.resultId))
+        val volume = bookWalker.books.single { it.number?.start == 1.0 }
+        val metadata = provider.getBookMetadata(bookWalker.id, volume.id).metadata
         check(metadata.links.single().url == work.books.first().url)
         check(metadata.authors.isNotEmpty())
+
+        HttpClient(OkHttp) {
+            engine {
+                addInterceptor { chain ->
+                    val request = chain.request()
+                    if (request.url.host == "book.dmm.com") {
+                        Response.Builder()
+                            .request(request)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(503)
+                            .message("DMM unavailable in fallback probe")
+                            .body("".toResponseBody())
+                            .build()
+                    } else chain.proceed(request)
+                }
+            }
+        }.use { fallbackClient ->
+            val fallbackProvider = BookWalkerMetadataProvider(ProviderConfig(enabled = true), fallbackClient)
+            val fallback = checkNotNull(fallbackProvider.matchSeriesMetadata(MatchQuery(query, null, null, null)))
+            check(fallback.metadata.links.single().url == work.books.first().url)
+            check(fallbackProvider.searchSeries(query, 10).first().resultId == fallback.id.value)
+        }
 
         val indexedId = ProviderSeriesId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         check(provider.matchSavedEdition(indexedId, emptyList()) == null)
         check(provider.matchSavedEdition(indexedId, listOf("${query}【描き下ろし漫画付き特装版】1.cbz")) == null)
-        check(provider.matchSavedEdition(automatic.id, emptyList())?.id == automatic.id)
-        println("Verified BookWalker web search, manual and automatic matching, volume metadata, and saved IDs without an index.")
+        check(provider.matchSavedEdition(bookWalker.id, emptyList())?.id == bookWalker.id)
+        println("Verified DMM priority, direct BookWalker lookup, volume metadata, and saved IDs without an index.")
     }
 }

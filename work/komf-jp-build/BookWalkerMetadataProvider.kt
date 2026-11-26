@@ -45,6 +45,7 @@ class BookWalkerMetadataProvider(
     private val bookExtraAfterVolume = Regex("""(?:\s*[【〖](?:描きおろし|描き下ろし|かきおろし|書き下ろし|書きおろし)[^】〗]*[】〗])+(?:\s*\([^()]+\))?\s*$""")
     private val store = BookWalkerStoreSearch(httpClient, category == "MANGA")
     private val dmm = DmmBooksFallback(httpClient, config).takeIf { category == "MANGA" }
+    private val ebookJapan = EbookJapanFallback(httpClient, config).takeIf { category == "MANGA" }
     private val allowedProduct = Regex("/de[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?")
     private val jsonLd = Regex("""<script\b[^>]*type=["']application/ld\+json["'][^>]*>(.*?)</script>""",
         setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
@@ -55,6 +56,14 @@ class BookWalkerMetadataProvider(
     override fun providerName() = CoreProviders.BOOK_WALKER
 
     override suspend fun searchSeries(seriesName: String, limit: Int): Collection<SeriesSearchResult> {
+        ebookJapan?.idFromUrl(seriesName)?.let { id ->
+            val match = ebookJapan.series(id) ?: return emptyList()
+            val title = match.metadata.title?.name ?: return emptyList()
+            return listOf(SeriesSearchResult(
+                url = match.metadata.links.firstOrNull()?.url ?: seriesName,
+                title = title, provider = providerName(), resultId = id.value,
+            ))
+        }
         val productId = store.productId(seriesName)
         if (productId != null) {
             val edition = resolveEdition(productId) ?: return emptyList()
@@ -63,21 +72,29 @@ class BookWalkerMetadataProvider(
         if ("://" in seriesName) return emptyList()
         val edition = publicationEdition(seriesName)
         val chapters = chapterEditionName.containsMatchIn(seriesName)
+        val resultLimit = limit.coerceIn(1, 100)
+        val dmmMatches = if (chapters) emptyList() else searchDmm(seriesName, edition = edition)
+        if (dmmMatches.isNotEmpty()) return dmmMatches.take(resultLimit).map { it.toSearchResult() }
+
         val indexed = candidates(seriesName, limit).mapNotNull { record ->
             selectEdition(editions(record), edition, chapters)
         }
         val queryKeys = titleVariants(seriesName).map(::searchKey).toSet()
         val exact = indexed.filter { matchesTitle(it, seriesName, queryKeys) }
         if (exact.isNotEmpty()) return exact.map { it.toSearchResult() }
-        val online = searchStore(seriesName).take(limit.coerceIn(1, 100)).mapNotNull { entry ->
+        val online = searchStore(seriesName).take(resultLimit).mapNotNull { entry ->
             selectEdition(editions(entry.id), edition, chapters)?.toSearchResult()
         }.distinctBy { it.resultId }
         if (online.isNotEmpty()) return online
-        val dmmResults = searchDmm(seriesName, allowPrefix = indexed.isEmpty(), edition = edition)
-            .take(limit.coerceIn(1, 100)).map { entry ->
-                SeriesSearchResult(url = entry.url, title = entry.title, provider = providerName(), resultId = entry.id)
-            }
-        return dmmResults.ifEmpty { indexed.map { it.toSearchResult() } }
+        // Keep shortened DMM title suggestions available after exact BookWalker matches.
+        if (!chapters && indexed.isEmpty()) {
+            val suggestions = searchDmm(seriesName, allowPrefix = true, edition = edition)
+            if (suggestions.isNotEmpty()) return suggestions.take(resultLimit).map { it.toSearchResult() }
+        }
+        val ebookJapanResults = if (chapters) emptyList() else searchEbookJapan(seriesName, edition)
+        return ebookJapanResults.take(resultLimit).map { hit ->
+            SeriesSearchResult(url = hit.url, title = hit.title, provider = providerName(), resultId = hit.id.value)
+        }.ifEmpty { indexed.map { it.toSearchResult() } }
     }
 
     override suspend fun matchSeriesMetadata(matchQuery: MatchQuery): ProviderSeriesMetadata? {
@@ -86,8 +103,16 @@ class BookWalkerMetadataProvider(
         val edition = publicationEdition(fileName) ?: publicationEdition(title)
         val searchKeys = titleVariants(title).map(::searchKey).toSet()
         val chapters = chapterEditionName.containsMatchIn(fileName) || chapterEditionName.containsMatchIn(title)
-        val queries = titleQueries(title)
-        if (queries.isEmpty() || "://" in title) return null
+        if (titleQueries(title).isEmpty() || "://" in title) return null
+        if (!chapters) {
+            val dmmMatches = searchDmm(title, edition = edition).ifEmpty {
+                fileName.takeIf { it.isNotBlank() && it != title }?.let { searchDmm(it, edition = edition) }.orEmpty()
+            }
+            dmmMatches.singleOrNull()?.let { hit ->
+                dmm?.series(ProviderSeriesId(hit.id))?.let { return it }
+            }
+        }
+
         val candidates = candidates(title, 25)
         val options = candidates.mapNotNull { record -> selectEdition(editions(record), edition, chapters) }
         val indexed = options.filter { matchesTitle(it, title, searchKeys) }.ifEmpty {
@@ -104,11 +129,11 @@ class BookWalkerMetadataProvider(
             .distinctBy { it.reference.url }
         if (online.isNotEmpty()) return online.singleOrNull()?.let { getSeriesMetadata(it) }
 
-        val hits = searchDmm(title, edition = edition).ifEmpty {
-            fileName.takeIf { it.isNotBlank() && it != title }?.let { searchDmm(it, edition = edition) }.orEmpty()
-        }
-        val fallback = hits.singleOrNull() ?: return null
-        return dmm?.series(ProviderSeriesId(fallback.id))
+        if (chapters) return null
+        val ebookJapanHit = searchEbookJapan(title, edition).ifEmpty {
+            fileName.takeIf { it.isNotBlank() && it != title }?.let { searchEbookJapan(it, edition) }.orEmpty()
+        }.singleOrNull() ?: return null
+        return ebookJapan?.series(ebookJapanHit.id, ebookJapanHit)
     }
 
     private fun matchesTitle(edition: Edition, title: String, searchKeys: Set<String>): Boolean {
@@ -132,6 +157,9 @@ class BookWalkerMetadataProvider(
         url = reference.url, title = title, provider = providerName(), resultId = id,
     )
 
+    private fun DmmBooksFallback.Hit.toSearchResult() =
+        SeriesSearchResult(url = url, title = title, provider = providerName(), resultId = id)
+
     private suspend fun searchDmm(
         title: String,
         allowPrefix: Boolean = false,
@@ -148,6 +176,13 @@ class BookWalkerMetadataProvider(
         return emptyList()
     }
 
+    private suspend fun searchEbookJapan(title: String, edition: PublicationEdition?): List<EbookJapanFallback.Hit> {
+        val variants = titleVariants(title, includeEditionless = false)
+        val fullTitle = variants.minByOrNull { it.length } ?: return emptyList()
+        val queries = listOf(fullTitle, withoutEditionMarker(fullTitle).trim())
+        return ebookJapan?.search(queries, variants, edition).orEmpty()
+    }
+
     private suspend fun searchStore(title: String): List<BookWalkerStoreSearch.Entry> {
         val variants = titleVariants(title)
         val cleaned = variants.minByOrNull { normalize(it).length } ?: return emptyList()
@@ -155,6 +190,9 @@ class BookWalkerMetadataProvider(
     }
 
     override suspend fun getSeriesMetadata(seriesId: ProviderSeriesId): ProviderSeriesMetadata {
+        if (ebookJapan?.accepts(seriesId) == true) {
+            return requireNotNull(ebookJapan.series(seriesId)) { "eBookJapan series not found" }
+        }
         if (dmm?.accepts(seriesId.value) == true) {
             return requireNotNull(dmm.series(seriesId)) { "DMM Books series not found" }
         }
@@ -167,6 +205,11 @@ class BookWalkerMetadataProvider(
         localFiles: Collection<String>,
     ): ProviderSeriesMetadata? {
         val requested = localFiles.mapNotNull(::publicationEdition).distinct().singleOrNull()
+        if (ebookJapan?.accepts(seriesId) == true) {
+            return ebookJapan.series(seriesId)?.takeIf {
+                requested == null || publicationEdition(it.metadata.title?.name.orEmpty()) == requested
+            }
+        }
         if (dmm?.accepts(seriesId.value) == true) {
             return dmm.series(seriesId)?.takeIf {
                 requested == null || publicationEdition(it.metadata.title?.name.orEmpty()) == requested
@@ -214,11 +257,14 @@ class BookWalkerMetadataProvider(
     }
 
     override suspend fun getSeriesCover(seriesId: ProviderSeriesId): Image? {
-        if (dmm?.accepts(seriesId.value) == true) return null
+        if (dmm?.accepts(seriesId.value) == true || ebookJapan?.accepts(seriesId) == true) return null
         return resolveEdition(seriesId.value)?.let { cover(details(it.reference.url).cover) }
     }
 
     override suspend fun getBookMetadata(seriesId: ProviderSeriesId, bookId: ProviderBookId): ProviderBookMetadata {
+        if (ebookJapan?.accepts(seriesId) == true) {
+            return requireNotNull(ebookJapan.book(seriesId, bookId)) { "eBookJapan volume not found" }
+        }
         if (dmm?.accepts(seriesId.value) == true) {
             return requireNotNull(dmm.book(seriesId, bookId)) { "DMM Books volume not found" }
         }
