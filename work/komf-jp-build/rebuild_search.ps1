@@ -12,12 +12,27 @@ $draft=Join-Path $stage 'komf-bookwalker-jp-2.0.1-search.jar'
 Copy-Item -LiteralPath $officialJar -Destination $draft -Force
 & (Join-Path (Split-Path $java) 'jar.exe') uf $draft -C $out snd
 if ($LASTEXITCODE) { throw 'JAR update failed' }
-& $java -cp $compiler org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -jvm-target 21 "-Xfriend-paths=$out" -classpath "$out;$draft" -d $testOut "$stage/LocalProviderProbe.kt" "$stage/StoreSearchProbe.kt" "$stage/PublicationStatusProbe.kt"
+& $java -cp $compiler org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -jvm-target 21 "-Xfriend-paths=$out" -classpath "$out;$draft" -d $testOut "$stage/LocalProviderProbe.kt" "$stage/StoreSearchProbe.kt" "$stage/PublicationStatusProbe.kt" "$stage/DmmBooksProbe.kt"
 if ($LASTEXITCODE) { throw 'Probe compilation failed' }
-$env:KOMF_BOOKWALKER_JP_DB="$stage/catalog.sqlite"
-& $java -cp "$testOut;$draft" LocalProviderProbeKt
-if ($LASTEXITCODE) { throw 'Provider probe failed' }
-& $java -cp "$testOut;$draft" snd.komf.providers.bookwalker.StoreSearchProbeKt
-if ($LASTEXITCODE) { throw 'Store search probe failed' }
-& $java -cp "$testOut;$draft" snd.komf.providers.bookwalker.PublicationStatusProbeKt
-if ($LASTEXITCODE) { throw 'Publication status probe failed' }
+$catalog = Join-Path $stage 'catalog.sqlite'
+$previousCatalog = $env:KOMF_BOOKWALKER_JP_DB
+$previousIndexEnabled = $env:KOMF_BOOKWALKER_JP_INDEX_ENABLED
+try {
+    $env:KOMF_BOOKWALKER_JP_DB = $catalog
+    $env:KOMF_BOOKWALKER_JP_INDEX_ENABLED = 'false'
+    & $java -cp "$testOut;$draft" snd.komf.providers.bookwalker.StoreSearchProbeKt
+    if ($LASTEXITCODE) { throw 'Store search probe failed' }
+    & $java -cp "$testOut;$draft" DmmBooksProbeKt
+    if ($LASTEXITCODE) { throw 'DMM Books probe failed' }
+
+    if (Test-Path -LiteralPath $catalog -PathType Leaf) {
+        $env:KOMF_BOOKWALKER_JP_INDEX_ENABLED = 'true'
+        & $java -cp "$testOut;$draft" LocalProviderProbeKt
+        if ($LASTEXITCODE) { throw 'Provider probe failed' }
+        & $java -cp "$testOut;$draft" snd.komf.providers.bookwalker.PublicationStatusProbeKt
+        if ($LASTEXITCODE) { throw 'Publication status probe failed' }
+    }
+} finally {
+    $env:KOMF_BOOKWALKER_JP_DB = $previousCatalog
+    $env:KOMF_BOOKWALKER_JP_INDEX_ENABLED = $previousIndexEnabled
+}

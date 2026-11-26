@@ -23,14 +23,16 @@ import java.sql.DriverManager
 import java.text.Normalizer
 import java.util.Locale
 
-/** Uses the Japanese store's official catalog, indexed locally with build_catalog.py. */
+/** Searches the Japanese storefront with an optional local index. */
 class BookWalkerMetadataProvider(
     private val config: ProviderConfig,
     private val httpClient: HttpClient,
 ) : MetadataProvider {
-    private val db = Path.of(
-        System.getenv("KOMF_BOOKWALKER_JP_DB") ?: "/config/bookwalker-jp/catalog.sqlite"
-    ).toAbsolutePath()
+    private val db = if (System.getenv("KOMF_BOOKWALKER_JP_INDEX_ENABLED").equals("false", ignoreCase = true)) {
+        null
+    } else {
+        Path.of(System.getenv("KOMF_BOOKWALKER_JP_DB") ?: "/config/bookwalker-jp/catalog.sqlite").toAbsolutePath()
+    }
     private val category = if (config.mediaType == MediaType.NOVEL) "NOVEL" else "MANGA"
     private val fileSuffix = Regex("\\.(?:cbz|cbr|zip|epub|kfx-zip)$", RegexOption.IGNORE_CASE)
     private val archiveHash = Regex("\\s*\\[[0-9a-f]{12,64}]$", RegexOption.IGNORE_CASE)
@@ -48,10 +50,6 @@ class BookWalkerMetadataProvider(
         setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
     private val detailsCache = object : LinkedHashMap<String, Details>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Details>?) = size > 128
-    }
-
-    init {
-        require(Files.isRegularFile(db)) { "BookWalker Japan catalog missing: $db" }
     }
 
     override fun providerName() = CoreProviders.BOOK_WALKER
@@ -169,11 +167,13 @@ class BookWalkerMetadataProvider(
         localFiles: Collection<String>,
     ): ProviderSeriesMetadata? {
         val requested = localFiles.mapNotNull(::publicationEdition).distinct().singleOrNull()
-            ?: return getSeriesMetadata(seriesId)
         if (dmm?.accepts(seriesId.value) == true) {
-            return dmm.series(seriesId)?.takeIf { publicationEdition(it.metadata.title?.name.orEmpty()) == requested }
+            return dmm.series(seriesId)?.takeIf {
+                requested == null || publicationEdition(it.metadata.title?.name.orEmpty()) == requested
+            }
         }
-        val edition = selectEdition(editions(seriesId.value.substringBefore('@')), requested, chapters = false)
+        val edition = if (requested == null) resolveEdition(seriesId.value)
+            else selectEdition(editions(seriesId.value.substringBefore('@')), requested, chapters = false)
         return edition?.let { getSeriesMetadata(it) }
     }
 
@@ -248,7 +248,7 @@ class BookWalkerMetadataProvider(
         if (queries.isEmpty()) return emptyList()
         val limit = requestedLimit.coerceIn(1, 100)
         return withContext(Dispatchers.IO) {
-            connect().use { connection ->
+            connect()?.use { connection ->
                 val found = linkedMapOf<String, Series>()
                 for (query in queries) for (column in listOf("search", "alias")) {
                     val exact = "SELECT * FROM series WHERE category=? AND $column=? LIMIT ?"
@@ -282,7 +282,7 @@ class BookWalkerMetadataProvider(
                     }
                 }
                 found.values.take(limit)
-            }
+            }.orEmpty()
         }
     }
 
@@ -334,7 +334,7 @@ class BookWalkerMetadataProvider(
     }
 
     private suspend fun indexedSeries(id: String): Series? = withContext(Dispatchers.IO) {
-        connect().use { c ->
+        connect()?.use { c ->
             c.prepareStatement("SELECT * FROM series WHERE id=? AND category=?").use { q ->
                 q.setString(1, id)
                 q.setString(2, category)
@@ -355,7 +355,7 @@ class BookWalkerMetadataProvider(
     }
 
     private suspend fun indexedBooks(id: String): List<Product> = withContext(Dispatchers.IO) {
-        connect().use { c ->
+        connect()?.use { c ->
             c.prepareStatement("""SELECT books.*, series.title AS series_title
                 FROM books JOIN series ON series.id=books.series_id WHERE books.series_id=?
                 ORDER BY volume IS NULL, volume, release, books.title""").use { q ->
@@ -371,10 +371,12 @@ class BookWalkerMetadataProvider(
                     }
                 }
             }
-        }
+        }.orEmpty()
     }
 
-    private fun connect() = DriverManager.getConnection("jdbc:sqlite:${db.toUri()}?mode=ro")
+    private fun connect() = db?.takeIf { Files.isRegularFile(it) }?.let {
+        DriverManager.getConnection("jdbc:sqlite:${it.toUri()}?mode=ro")
+    }
 
     private fun java.sql.ResultSet.toSeries() =
         Series(getString("id"), getString("title"), getString("search"), getString("alias"), getString("publisher"))

@@ -3,6 +3,9 @@ package snd.komf.providers.bookwalker
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import kotlinx.coroutines.runBlocking
+import snd.komf.model.MatchQuery
+import snd.komf.model.ProviderSeriesId
+import snd.komf.providers.ProviderConfig
 import java.text.Normalizer
 
 fun main() = runBlocking {
@@ -25,6 +28,21 @@ fun main() = runBlocking {
         check(work.title == query)
         check(work.books.first().url == "https://bookwalker.jp/deeec38e85-1546-40d9-93cc-a6815596fb91/")
         check(work.publisher == "講談社")
-        println("Verified public storefront search, stable series ID, and volume pages.")
+
+        val provider = BookWalkerMetadataProvider(ProviderConfig(enabled = true), http)
+        val automatic = checkNotNull(provider.matchSeriesMetadata(MatchQuery(query, null, null, null)))
+        check(automatic.id.value.substringBefore('@') == own.id)
+        val manual = provider.searchSeries(query, 10)
+        check(manual.any { it.resultId == automatic.id.value })
+        val volume = automatic.books.single { it.number?.start == 1.0 }
+        val metadata = provider.getBookMetadata(automatic.id, volume.id).metadata
+        check(metadata.links.single().url == work.books.first().url)
+        check(metadata.authors.isNotEmpty())
+
+        val indexedId = ProviderSeriesId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        check(provider.matchSavedEdition(indexedId, emptyList()) == null)
+        check(provider.matchSavedEdition(indexedId, listOf("${query}【描き下ろし漫画付き特装版】1.cbz")) == null)
+        check(provider.matchSavedEdition(automatic.id, emptyList())?.id == automatic.id)
+        println("Verified BookWalker web search, manual and automatic matching, volume metadata, and saved IDs without an index.")
     }
 }
