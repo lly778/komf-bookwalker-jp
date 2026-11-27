@@ -161,6 +161,8 @@ internal class BookWalkerStoreSearch(private val client: HttpClient, private val
     data class Book(val title: String, val url: String, val label: String, val release: String = "")
 }
 
+internal const val SUBTITLE_DASHES = "-‐‑–—―−"
+
 private val retailerBonus = Regex(
     """[【〖\[](?:(?:DMM|Amazon(?:\.co\.jp)?|電子(?:コミック|書籍|版)?)限定)[^】〗\]\r\n]*特典[^】〗\]\r\n]*[】〗\]]?""",
     RegexOption.IGNORE_CASE,
@@ -176,7 +178,8 @@ private val mangaVolumeSuffix = Regex(
 internal fun mangaVolumeAfterTitle(series: String, book: String): BookRange? {
     fun normalizedTitle(value: String) = withoutEditionMarker(Normalizer.normalize(value, Normalizer.Form.NFKC))
         .let(::withoutVolumeBonus).replace(retailerBonus, "")
-    val prefix = normalizedTitle(withoutCatalogSeriesSuffix(series)).filter(Char::isLetterOrDigit)
+    val seriesTitle = normalizedTitle(withoutCatalogSeriesSuffix(series)).trimEnd()
+    val prefix = seriesTitle.filter(Char::isLetterOrDigit)
     if (prefix.isEmpty()) return null
 
     val name = normalizedTitle(book)
@@ -185,8 +188,9 @@ internal fun mangaVolumeAfterTitle(series: String, book: String): BookRange? {
         if (!char.isLetterOrDigit()) continue
         if (!char.equals(prefix[index], ignoreCase = true)) return null
         if (++index == prefix.length) {
+            val hasClosingDash = seriesTitle.last() in SUBTITLE_DASHES
             val tail = name.substring(position + 1).trimStart {
-                it.isWhitespace() || it in ")」』】〗~〜～:!?。"
+                it.isWhitespace() || it in ")」』】〗~〜～:!?。" || (hasClosingDash && it in SUBTITLE_DASHES)
             }
             val afterImprint = volumeImprint.replaceFirst(tail, "")
             val match = mangaVolumeSuffix.find(afterImprint)

@@ -40,6 +40,7 @@ class BookWalkerMetadataProvider(
     private val parenthesizedVolume = Regex("\\s*\\([0-9]{1,4}\\)")
     private val subtitleSeparator = Regex("[~～〜：:]")
     private val trailingSubtitle = Regex("""[~〜]([^~〜]+)[~〜](?:\s*[【〖][^】〗]+[】〗])?$""")
+    private val dashSubtitle = Regex("""\s+[$SUBTITLE_DASHES]\s*(\S.*?)\s*[$SUBTITLE_DASHES](?:\s*[【〖][^】〗]+[】〗])?$""")
     private val creditSuffix = Regex("[（(]([^（）()]+)[）)]$")
     private val dmmVolumeSuffix = Regex("""(?<=[】〗])[0-9]{1,4}(?:巻)?(?:\s*\([^()]+\))?$""")
     private val bookExtraAfterVolume = Regex("""(?:\s*[【〖](?:描きおろし|描き下ろし|かきおろし|書き下ろし|書きおろし)[^】〗]*[】〗])+(?:\s*\([^()]+\))?\s*$""")
@@ -145,9 +146,9 @@ class BookWalkerMetadataProvider(
         }
     }
 
-    private fun titleWithSubtitle(title: String): Pair<String, String>? {
+    private fun titleWithSubtitle(title: String, separator: Regex = trailingSubtitle): Pair<String, String>? {
         val normalized = Normalizer.normalize(title, Normalizer.Form.NFKC).trim()
-        val match = trailingSubtitle.find(normalized) ?: return null
+        val match = separator.find(normalized) ?: return null
         val base = normalized.substring(0, match.range.first).trimEnd()
         if (normalize(base).length < 8) return null
         return base to match.groupValues[1]
@@ -165,12 +166,15 @@ class BookWalkerMetadataProvider(
         allowPrefix: Boolean = false,
         edition: PublicationEdition? = null,
     ): List<DmmBooksFallback.Hit> {
+        val source = dmm ?: return emptyList()
         val variants = titleVariants(title, includeEditionless = false)
         val query = variants.minByOrNull { normalize(it).length } ?: return emptyList()
         val storefrontQuery = query.replace('~', '〜').replace('～', '〜')
-        for (searchTerm in listOf(query, storefrontQuery).distinct()) {
-            val hits = dmm?.search(searchTerm, variants, ::searchKey, allowPrefix).orEmpty()
-                .filter { edition == null || publicationEdition(it.title) == edition }
+        val shortTitle = titleWithSubtitle(query, dashSubtitle)?.first ?: titleWithSubtitle(query)?.first
+        val originalQueries = listOf(query, storefrontQuery)
+        val queries = originalQueries + listOfNotNull(shortTitle, dmmTitleWithoutEdition(query))
+        for (searchTerm in queries.distinct()) {
+            val hits = source.search(searchTerm, variants, edition, allowPrefix && searchTerm in originalQueries)
             if (hits.isNotEmpty()) return hits
         }
         return emptyList()

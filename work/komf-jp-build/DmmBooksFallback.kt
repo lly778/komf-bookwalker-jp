@@ -27,6 +27,7 @@ internal class DmmBooksFallback(private val http: HttpClient, private val config
     private val idPrefix = "dmm-books-"
     private val productPath = Regex("/product/([0-9]{1,12})/([a-z0-9]{1,64})/")
     private val promotional = Regex("期間限定|試し読み|無料版|分冊版|単話版|[（(【]単話[）)】]|タテヨミ")
+    private val trailingVolume = Regex("""(?:\s*(?:第\s*)?\([0-9]{1,4}(?:\.[0-9]+)?\)|\s+(?:第\s*)?[0-9]{1,4}(?:\.[0-9]+)?(?:\s*巻)?)$""")
     private val latestMarker = Regex("""\s*[（(]最新刊[）)]$""")
     private val slots = Semaphore(2)
     private val products = object : LinkedHashMap<String, Product>(128, 0.75f, true) {
@@ -38,12 +39,13 @@ internal class DmmBooksFallback(private val http: HttpClient, private val config
     suspend fun search(
         title: String,
         exactTitles: List<String>,
-        editionless: (String) -> String,
+        requestedEdition: PublicationEdition?,
         allowPrefix: Boolean,
     ): List<Hit> {
         if (title.isBlank() || title.length > 240 || "://" in title) return emptyList()
         val exact = exactTitles.map(::key).filter(String::isNotEmpty).toSet()
-        val hasEdition = exactTitles.any { key(it) != editionless(it) }
+        val baseTitles = exactTitles.map { key(dmmTitleWithoutEdition(it)) }.filter(String::isNotEmpty).toSet()
+        val query = normalize(title).lowercase(Locale.ROOT)
         val hits = fetch("$base/search/", title)?.select(".m-boxSearchListTmb__ttl").orEmpty()
             .mapNotNull { name ->
                 val path = path(name.closest("a")?.attr("href").orEmpty()) ?: return@mapNotNull null
@@ -51,20 +53,28 @@ internal class DmmBooksFallback(private val http: HttpClient, private val config
                 if (label.isEmpty() || promotional.containsMatchIn(label)) return@mapNotNull null
                 Hit(idPrefix + path.groupValues.drop(1).joinToString("-"), label, base + path.value)
             }.distinctBy { it.id }
-        val exactHits = hits.filter { key(it.title) in exact }
-        if (exactHits.isNotEmpty()) return mangaHits(exactHits)
-        if (hasEdition) return emptyList()
-        val editionHits = hits.filter { editionless(it.title) in exact }
-        if (editionHits.isNotEmpty() || !allowPrefix || title.length < 8) return mangaHits(editionHits)
-        val prefix = normalize(title).lowercase(Locale.ROOT)
-        return mangaHits(hits.filter { hit ->
+        val matches = hits.mapNotNull { hit ->
+            val listingKey = key(dmmTitleWithoutEdition(hit.title))
             val name = normalize(hit.title).lowercase(Locale.ROOT)
-            name.startsWith(prefix) && name.getOrNull(prefix.length) in setOf(' ', '〜', '~', '：', ':', '―', '─')
-        })
+            val rank = when {
+                key(hit.title) in exact -> 0
+                listingKey in baseTitles -> 1
+                listingKey.length >= 8 && baseTitles.any { it.startsWith(listingKey) } -> 2
+                allowPrefix && query.length >= 8 && name.startsWith(query) &&
+                    name.length > query.length && name[query.length] in " 〜~：:―─" -> 3
+                else -> return@mapNotNull null
+            }
+            val product = path(hit.url)?.value?.let { load(it) } ?: return@mapNotNull null
+            if (requestedEdition != null && publicationEdition(product.seriesTitle) != requestedEdition) {
+                return@mapNotNull null
+            }
+            // Short store labels need the complete title from the product page.
+            if (rank == 2 && key(dmmTitleWithoutEdition(product.seriesTitle)) !in baseTitles) return@mapNotNull null
+            rank to hit.copy(title = product.seriesTitle)
+        }
+        val best = matches.minOfOrNull { it.first } ?: return emptyList()
+        return matches.filter { it.first == best }.map { it.second }
     }
-
-    private suspend fun mangaHits(hits: List<Hit>): List<Hit> =
-        hits.filter { hit -> path(hit.url)?.value?.let { load(it) } != null }
 
     suspend fun series(id: ProviderSeriesId): ProviderSeriesMetadata? {
         val reference = pathFromId(id.value)?.let { load(it) } ?: return null
@@ -191,10 +201,13 @@ internal class DmmBooksFallback(private val http: HttpClient, private val config
             val element = entry.selectFirst("dd") ?: return@mapNotNull null
             term to element
         }.toMap()
-        val seriesTitle = fields["シリーズ名"]?.text()?.takeIf(String::isNotBlank) ?: title
+        val imprint = fields["掲載誌・レーベル"]?.text()
+        if (imprint.equals("GIGATOON", ignoreCase = true)) return null
+        val seriesName = fields["シリーズ名"]?.text()?.takeIf(String::isNotBlank) ?: title
+        val seriesTitle = resolveSeriesTitle(seriesName, title)
         val seriesUrl = (book["isPartOf"] as? JsonObject)?.string("url")
         val authors = people(book["author"]).map { Author(it, AuthorRole.WRITER) }
-        val tags = (strings(book["genre"]) + listOfNotNull(fields["掲載誌・レーベル"]?.text())).toSet()
+        val tags = (strings(book["genre"]) + listOfNotNull(imprint)).toSet()
         val volumes = document.select("""[data-testid="volume-book-list"] a[data-is-limited=false]""")
             .mapNotNull { link ->
                 val path = path(link.attr("href"))?.takeIf { it.groupValues[1] == seriesKey } ?: return@mapNotNull null
@@ -227,6 +240,24 @@ internal class DmmBooksFallback(private val http: HttpClient, private val config
             products[requestedPath] = data
         }
         return data
+    }
+
+    private fun resolveSeriesTitle(listing: String, book: String): String {
+        val base = dmmTitleWithoutEdition(listing)
+        val edition = publicationEdition(book) ?: publicationEdition(listing)
+        val listingWithEdition = when {
+            edition == null || publicationEdition(listing) == edition && withoutEditionMarker(listing) != listing -> listing
+            else -> "$base【" + edition.label + "】"
+        }
+        if (edition == PublicationEdition.SPECIAL || mangaVolumeAfterTitle(listingWithEdition, book) != null) {
+            return listingWithEdition
+        }
+
+        val bookTitle = dmmTitleWithoutEdition(book).replace(trailingVolume, "").trimEnd()
+        val baseKey = key(base)
+        val bookKey = key(bookTitle)
+        if (bookKey.length <= baseKey.length || !bookKey.startsWith(baseKey)) return listingWithEdition
+        return edition?.let { "$bookTitle【" + it.label + "】" } ?: bookTitle
     }
 
     private fun Product.volumeNumber(): BookRange? = mangaVolumeAfterTitle(seriesTitle, title)
@@ -301,3 +332,9 @@ internal class DmmBooksFallback(private val http: HttpClient, private val config
         val checkedAt: Long = System.nanoTime(),
     )
 }
+
+private val dmmBareEdition = Regex("""\s+(?:特装版|電子特別版)$""")
+
+internal fun dmmTitleWithoutEdition(title: String): String =
+    withoutEditionMarker(withoutVolumeBonus(Normalizer.normalize(title, Normalizer.Form.NFKC)))
+        .replace(dmmBareEdition, "").trim()

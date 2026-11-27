@@ -53,6 +53,7 @@ import java.util.Locale
 private val logger = KotlinLogging.logger {}
 private val bookWalkerFileSuffix = Regex("\\.(?:cbz|cbr|zip|epub|kfx-zip)$", RegexOption.IGNORE_CASE)
 private val bookWalkerArchiveHash = Regex("\\s*\\[[0-9a-f]{12,64}]$", RegexOption.IGNORE_CASE)
+private val maskedTitleRun = Regex("[○◯〇]{2,}")
 private val bookWalkerPublicationLabel = Regex("\\s*\\(([^()]+)\\)$")
 private val bookWalkerVolumeMarker = Regex("\\([0-9]{1,4}\\)")
 private val bookWalkerNumberSuffix = Regex("(?<=\\d)巻$")
@@ -369,7 +370,19 @@ class MetadataService(
             return listOfNotNull(key(bookWalkerNumberSuffix.replace(noEdition, "")), reordered)
         }
         val alternate = variants.flatMap(::alternateKeys).filter(String::isNotEmpty).toSet()
-        return providerBooks.filter { book -> book.name?.let(::alternateKeys)?.any(alternate::contains) == true }.singleOrNull()
+        val alternateMatches = providerBooks.filter { book -> book.name?.let(::alternateKeys)?.any(alternate::contains) == true }
+        if (alternateMatches.isNotEmpty()) return alternateMatches.singleOrNull()
+
+        val maskedPatterns = variants.mapNotNull { name ->
+            val anchors = maskedTitleRun.split(name).map(::key)
+            if (anchors.size < 2 || anchors.any(String::isEmpty)) return@mapNotNull null
+            anchors.joinToString("\\p{L}+", transform = Regex::escape).toRegex()
+        }
+        if (maskedPatterns.isEmpty()) return null
+        return providerBooks.filter { book ->
+            val title = book.name?.let(::key) ?: return@filter false
+            maskedPatterns.any { it.matches(title) }
+        }.singleOrNull()
     }
 
     private fun getBookNumber(bookName: String): BookRange? {
